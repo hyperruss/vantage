@@ -2,7 +2,8 @@ import { Check, ImageSquare, Minus } from "@phosphor-icons/react";
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { Brand, Header } from "./controls";
-import { clock, duration, money, planName, price, rentalConfig } from "./rental";
+import type { Tariffs } from "./api";
+import { bookingMinutes, clock, duration, money, planName } from "./rental";
 import type { Car, Plan, Receipt, Ride } from "./rental";
 
 export function Splash() {
@@ -114,8 +115,8 @@ function Vehicle({ car, onPhoto, status }: {
   );
 }
 
-export function FleetSheet({ car, plan, onPlan, onBook, onPhoto, onCollapse, pending }: {
-  car: Car; plan: Plan; onPlan: (plan: Plan) => void; onBook: () => void; onPhoto: () => void;
+export function FleetSheet({ car, plan, tariffs, onPlan, onBook, onPhoto, onCollapse, pending }: {
+  car: Car; plan: Plan; tariffs: Tariffs; onPlan: (plan: Plan) => void; onBook: () => void; onPhoto: () => void;
   onCollapse: () => void; pending: boolean;
 }) {
   return (
@@ -131,13 +132,13 @@ export function FleetSheet({ car, plan, onPlan, onBook, onPhoto, onCollapse, pen
         <div className="plans-grid">
           <label className="plan">
             <input type="radio" name="plan" checked={plan.mode === "fixed"}
-              onChange={() => onPlan({ mode: "fixed", hours: rentalConfig.hours[0] })} />
-            <span><strong>На срок</strong><small>{money(rentalConfig.hourlyPrice)} в час</small></span>
+              onChange={() => onPlan({ mode: "fixed", hours: tariffs.hours[0] })} />
+            <span><strong>На срок</strong><small>{money(tariffs.fixedHourKopecks / 100)} в час</small></span>
           </label>
           <label className="plan">
             <input type="radio" name="plan" checked={plan.mode === "metered"}
               onChange={() => onPlan({ mode: "metered" })} />
-            <span><strong>По факту</strong><small>{money(rentalConfig.minutePrice)} в минуту</small></span>
+            <span><strong>По факту</strong><small>{money(tariffs.meteredMinuteKopecks / 100)} в минуту</small></span>
           </label>
         </div>
       </fieldset>
@@ -146,7 +147,7 @@ export function FleetSheet({ car, plan, onPlan, onBook, onPhoto, onCollapse, pen
           <fieldset className="terms">
             <legend>Срок аренды</legend>
             <div className="term-options">
-              {rentalConfig.hours.map((hours) => (
+              {tariffs.hours.map((hours) => (
                 <button type="button" key={hours} aria-pressed={hours === plan.hours}
                   onClick={() => onPlan({ mode: "fixed", hours })}>{hours} ч</button>
               ))}
@@ -155,7 +156,7 @@ export function FleetSheet({ car, plan, onPlan, onBook, onPhoto, onCollapse, pen
         ) : <p className="plan-note">Оплата за фактическое время поездки</p>}
       </div>
       <button className="action" type="button" onClick={onBook} disabled={pending}>Забронировать</button>
-      <p className="sheet-note">Бронь бесплатна {rentalConfig.bookingMinutes} минут</p>
+      <p className="sheet-note">Бронь бесплатна {bookingMinutes} минут</p>
       </>}
     </section>
   );
@@ -186,8 +187,8 @@ function Journey({ children, onProfile }: { children: ReactNode; onProfile: () =
   );
 }
 
-export function ActiveRide({ ride, car, elapsed, onFinish, onProfile }: {
-  ride: Ride; car: Car; elapsed: number; onFinish: () => void; onProfile: () => void;
+export function ActiveRide({ ride, car, elapsed, total, onFinish, onProfile }: {
+  ride: Ride; car: Car; elapsed: number; total: number | null; onFinish: () => void; onProfile: () => void;
 }) {
   const remaining = ride.plan.mode === "fixed" ? ride.plan.hours * 3600 - elapsed : 0;
   const fixed = ride.plan.mode === "fixed";
@@ -206,7 +207,7 @@ export function ActiveRide({ ride, car, elapsed, onFinish, onProfile }: {
       </div>
       <div className="metric-row">
         <span>{fixed && remaining >= 0 ? "Стоимость периода" : "Текущая сумма"}</span>
-        <strong>{money(price(ride.plan, elapsed))}</strong>
+        <strong>{total === null ? "…" : money(total)}</strong>
       </div>
       <div className="journey-footer">
         <button className="action" type="button" onClick={onFinish}>Завершить поездку</button>
@@ -215,8 +216,8 @@ export function ActiveRide({ ride, car, elapsed, onFinish, onProfile }: {
   );
 }
 
-export function Payment({ receipt, car, onPay, onProfile }: {
-  receipt: Receipt; car: Car; onPay: () => void; onProfile: () => void;
+export function Payment({ receipt, car, pending, error, onPay, onProfile }: {
+  receipt: Receipt; car: Car; pending: boolean; error: string; onPay: () => void; onProfile: () => void;
 }) {
   return (
     <Journey onProfile={onProfile}>
@@ -231,7 +232,10 @@ export function Payment({ receipt, car, onPay, onProfile }: {
       </div>
       <div className="metric-row"><span>Длительность</span><strong>{duration(receipt.elapsed)}</strong></div>
       <div className="journey-footer">
-        <button className="action" type="button" onClick={onPay}>Оплатить</button>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <button className="action" type="button" disabled={pending} onClick={onPay}>
+          {pending ? "Сохраняем оплату…" : "Оплатить"}
+        </button>
       </div>
     </Journey>
   );

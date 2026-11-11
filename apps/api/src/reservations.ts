@@ -3,6 +3,7 @@ import type { ErrorRequestHandler, Response } from "express";
 import type { Pool, PoolClient } from "pg";
 import { zonePolygon } from "./map.js";
 import { findUser } from "./session.js";
+import { tariffs } from "./tariffs.js";
 
 type Reservation = {
   id: number;
@@ -13,11 +14,27 @@ type Reservation = {
   expires_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
+  paid_at: Date | null;
+  fixed_hour_kopecks: number;
+  metered_minute_kopecks: number;
+  elapsed_seconds: string | null;
+  total_kopecks: string | null;
+  live_elapsed_seconds?: string | null;
+  live_total_kopecks?: string | null;
 };
 
 export const liveReservation = "status = 'active' OR (status = 'reserved' AND expires_at > statement_timestamp())";
 
+const pricingProjection = `
+  CASE WHEN r.status = 'active' THEN vantage_ride_seconds(r.started_at, statement_timestamp()) END AS live_elapsed_seconds,
+  CASE WHEN r.status = 'active' THEN vantage_ride_kopecks(
+    r.mode, r.hours, r.fixed_hour_kopecks, r.metered_minute_kopecks, vantage_ride_seconds(r.started_at, statement_timestamp())
+  ) END AS live_total_kopecks
+`;
+
 function serialize(row: Reservation) {
+  const elapsed = row.live_elapsed_seconds ?? row.elapsed_seconds;
+  const amount = row.live_total_kopecks ?? row.total_kopecks;
   return {
     id: row.id,
     carId: row.car_id,
@@ -26,6 +43,11 @@ function serialize(row: Reservation) {
     expiresAt: row.expires_at.getTime(),
     startedAt: row.started_at?.getTime() ?? null,
     finishedAt: row.finished_at?.getTime() ?? null,
+    paidAt: row.paid_at?.getTime() ?? null,
+    fixedHourKopecks: row.fixed_hour_kopecks,
+    meteredMinuteKopecks: row.metered_minute_kopecks,
+    elapsedSeconds: elapsed === null ? null : Number(elapsed),
+    amountKopecks: amount === null ? null : Number(amount),
   };
 }
 
@@ -86,13 +108,16 @@ export function reservationRouter(db: Pool) {
 
   router.get("/", async (_request, response) => {
     const { rows } = await db.query<Reservation & { kind: "current" | "completed" | "closed" }>(`
-      (SELECT 'current' AS kind, r.* FROM reservations r WHERE user_id = $1 AND (${liveReservation}) LIMIT 1)
-      UNION ALL
-      (SELECT 'completed' AS kind, r.* FROM reservations r WHERE user_id = $1 AND status = 'completed' ORDER BY id DESC LIMIT 1)
-      UNION ALL
-      (SELECT 'closed' AS kind, r.* FROM reservations r WHERE user_id = $1 AND (
-        status IN ('expired', 'cancelled') OR (status = 'reserved' AND expires_at <= statement_timestamp())
-      ) ORDER BY id DESC LIMIT 1)
+      SELECT r.*, ${pricingProjection} FROM (
+        (SELECT 'current' AS kind, reservations.* FROM reservations WHERE user_id = $1 AND (${liveReservation}) LIMIT 1)
+        UNION ALL
+        (SELECT 'completed' AS kind, reservations.* FROM reservations
+          WHERE user_id = $1 AND status = 'completed' ORDER BY id DESC LIMIT 1)
+        UNION ALL
+        (SELECT 'closed' AS kind, reservations.* FROM reservations WHERE user_id = $1 AND (
+          status IN ('expired', 'cancelled') OR (status = 'reserved' AND expires_at <= statement_timestamp())
+        ) ORDER BY id DESC LIMIT 1)
+      ) r
     `, [response.locals.userId]);
     const current = rows.find((row) => row.kind === "current");
     const completed = rows.find((row) => row.kind === "completed");
@@ -101,15 +126,20 @@ export function reservationRouter(db: Pool) {
       current: current ? serialize(current) : null,
       completed: completed ? serialize(completed) : null,
       closed: closed ? { id: closed.id, status: closed.status === "cancelled" ? "cancelled" : "expired" } : null,
+      tariffs,
       serverTime: Date.now(),
     });
   });
 
   router.post("/", express.json({ limit: "2kb" }), async (request, response) => {
-    const { carId, mode, hours } = request.body ?? {};
-    if (!positiveId(carId) || !(mode === "fixed" && [1, 2, 3].includes(hours)
+    const { carId, mode, hours, fixedHourKopecks, meteredMinuteKopecks } = request.body ?? {};
+    if (!positiveId(carId) || !(mode === "fixed" && tariffs.hours.includes(hours)
       || mode === "metered" && hours === undefined)) {
       return fail(response, 400, "invalid_reservation");
+    }
+    if ((fixedHourKopecks !== undefined && fixedHourKopecks !== tariffs.fixedHourKopecks)
+      || (meteredMinuteKopecks !== undefined && meteredMinuteKopecks !== tariffs.meteredMinuteKopecks)) {
+      return fail(response, 409, "tariff_changed");
     }
     const userId = response.locals.userId;
     const result = await locked(db, async (client) => {
@@ -127,10 +157,12 @@ export function reservationRouter(db: Pool) {
       if (busy.rowCount) return { error: "car_unavailable" } as const;
 
       const { rows } = await client.query<Reservation>(`
-        INSERT INTO reservations (user_id, car_id, mode, hours, created_at, expires_at)
-        VALUES ($1, $2, $3, $4, statement_timestamp(), statement_timestamp() + interval '20 minutes')
+        INSERT INTO reservations (
+          user_id, car_id, mode, hours, created_at, expires_at, fixed_hour_kopecks, metered_minute_kopecks
+        )
+        VALUES ($1, $2, $3, $4, statement_timestamp(), statement_timestamp() + interval '20 minutes', $5, $6)
         RETURNING *
-      `, [userId, carId, mode, hours ?? null]);
+      `, [userId, carId, mode, hours ?? null, tariffs.fixedHourKopecks, tariffs.meteredMinuteKopecks]);
       return { reservation: serialize(rows[0]) };
     });
     if (result.error) return fail(response, 409, result.error);
@@ -141,7 +173,8 @@ export function reservationRouter(db: Pool) {
     const result = await locked(db, async (client) => {
       await expire(client);
       const { rows: [row] } = await client.query<Reservation>(
-        "SELECT * FROM reservations WHERE id = $1 AND user_id = $2", [id, response.locals.userId],
+        `SELECT r.*, ${pricingProjection} FROM reservations r WHERE id = $1 AND user_id = $2`,
+        [id, response.locals.userId],
       );
       if (!row) return { error: "reservation_not_found", status: 404 } as const;
       if (row.status === "expired") return { error: "reservation_expired", status: 409 } as const;
@@ -163,12 +196,19 @@ export function reservationRouter(db: Pool) {
       }
 
       const { rows } = await client.query<Reservation>(`
-        UPDATE reservations SET
-          status = $2,
-          started_at = CASE WHEN $2 = 'active' THEN statement_timestamp() ELSE started_at END,
-          finished_at = CASE WHEN $2 = 'completed' THEN statement_timestamp() ELSE finished_at END
-        WHERE id = $1 AND ($2 <> 'active' OR expires_at > statement_timestamp())
-        RETURNING *
+        WITH updated AS (
+          UPDATE reservations SET
+            status = $2,
+            started_at = CASE WHEN $2 = 'active' THEN statement_timestamp() ELSE started_at END,
+            finished_at = CASE WHEN $2 = 'completed' THEN statement_timestamp() ELSE finished_at END,
+            elapsed_seconds = CASE WHEN $2 = 'completed' THEN vantage_ride_seconds(started_at, statement_timestamp()) END,
+            total_kopecks = CASE WHEN $2 = 'completed' THEN vantage_ride_kopecks(
+              mode, hours, fixed_hour_kopecks, metered_minute_kopecks, vantage_ride_seconds(started_at, statement_timestamp())
+            ) END
+          WHERE id = $1 AND ($2 <> 'active' OR expires_at > statement_timestamp())
+          RETURNING *
+        )
+        SELECT r.*, ${pricingProjection} FROM updated r
       `, [id, action === "start" ? "active" : action === "finish" ? "completed" : "cancelled"]);
       if (!rows[0]) {
         await expire(client);
@@ -196,6 +236,24 @@ export function reservationRouter(db: Pool) {
     if (!positiveId(id) || !Number.isFinite(lat) || Math.abs(lat) > 85
       || !Number.isFinite(lng) || Math.abs(lng) > 180) return fail(response, 400, "invalid_point");
     await change(response, id, "finish", { lat, lng });
+  });
+
+  router.post("/:id/pay", async (request, response) => {
+    const id = Number(request.params.id);
+    if (!positiveId(id)) return fail(response, 400, "invalid_reservation");
+
+    const params = [id, response.locals.userId];
+    const { rows: [paid] } = await db.query<Reservation>(`
+      UPDATE reservations
+      SET paid_at = COALESCE(paid_at, GREATEST(finished_at, statement_timestamp()))
+      WHERE id = $1 AND user_id = $2 AND status = 'completed'
+      RETURNING *
+    `, params);
+    if (paid) return response.json({ reservation: serialize(paid) });
+
+    const owned = await db.query("SELECT 1 FROM reservations WHERE id = $1 AND user_id = $2", params);
+    return owned.rowCount ? fail(response, 409, "invalid_reservation_state")
+      : fail(response, 404, "reservation_not_found");
   });
 
   router.use(handleError);

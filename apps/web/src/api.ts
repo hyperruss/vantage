@@ -1,6 +1,11 @@
 import type { Car, Plan, Point } from "./rental";
 
 export type User = { id: string; name: string };
+export type Tariffs = {
+  hours: number[];
+  fixedHourKopecks: number;
+  meteredMinuteKopecks: number;
+};
 export type MapSettings = {
   tileUrl: string;
   attribution: string;
@@ -15,12 +20,16 @@ export type Reservation = {
   expiresAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  paidAt: number | null;
+  elapsedSeconds: number | null;
+  amountKopecks: number | null;
 };
 export type FleetSnapshot = {
   cars: Car[];
   current: Reservation | null;
   completed: Reservation | null;
   closed: { id: number; status: "cancelled" | "expired" } | null;
+  tariffs: Tariffs;
   clockOffset: number;
 };
 
@@ -86,24 +95,31 @@ export function getMapSettings(signal: AbortSignal) {
 }
 
 export async function getFleetSnapshot(signal: AbortSignal): Promise<FleetSnapshot> {
-  const [cars, { current, completed, closed, serverTime }] = await Promise.all([
+  const [cars, { serverTime, ...reservations }] = await Promise.all([
     getCars(signal),
     request<Omit<FleetSnapshot, "cars" | "clockOffset"> & { serverTime: number }>(
       "/api/reservations", { signal },
     ),
   ]);
-  return { cars, current, completed, closed, clockOffset: serverTime - Date.now() };
+  return { cars, ...reservations, clockOffset: serverTime - Date.now() };
 }
 
-async function reservationChange(path: string, method: "POST" | "DELETE", body?: object) {
+async function reservationChange(path: string, method: "POST" | "DELETE", body?: object, signal?: AbortSignal) {
   const { reservation } = await request<{ reservation: Reservation }>(`/api/reservations${path}`, {
     method,
+    signal,
     ...(body && { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   });
   return reservation;
 }
 
-export const reserveCar = (carId: number, plan: Plan) => reservationChange("", "POST", { carId, ...plan });
+export const reserveCar = (carId: number, plan: Plan, tariffs: Tariffs) => reservationChange("", "POST", {
+  carId,
+  ...plan,
+  fixedHourKopecks: tariffs.fixedHourKopecks,
+  meteredMinuteKopecks: tariffs.meteredMinuteKopecks,
+});
 export const cancelReservation = (id: number) => reservationChange(`/${id}`, "DELETE");
 export const beginRide = (id: number) => reservationChange(`/${id}/start`, "POST");
 export const finishRide = (id: number, point: Point) => reservationChange(`/${id}/finish`, "POST", point);
+export const payReservation = (id: number, signal?: AbortSignal) => reservationChange(`/${id}/pay`, "POST", undefined, signal);

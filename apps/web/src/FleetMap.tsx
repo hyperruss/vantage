@@ -4,13 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { MapContainer, Marker, Polygon, TileLayer, useMap, useMapEvents } from "react-leaflet";
-import type { Marker as LeafletMarker } from "leaflet";
+import type { LeafletMouseEvent, Marker as LeafletMarker } from "leaflet";
 import "leaflet/dist/leaflet.css";
 import type { MapSettings } from "./api";
 import { insideZone } from "./rental";
 import type { Car, Point } from "./rental";
 
-const offsets = [[0, 0], [-48, 0], [48, 0], [0, -48], [0, 48], [-48, -48], [48, -48]];
+const pinHitSizes = { full: 48, compact: 34, dot: 24 };
+type PinSize = keyof typeof pinHitSizes;
 type MapCar = Car & { active: boolean };
 
 type MapProps = {
@@ -26,55 +27,77 @@ type MapProps = {
 
 function MapLayout({ field, zone }: { field: RefObject<HTMLDivElement | null>; zone: MapSettings["zone"] }) {
   const map = useMap();
+  const manuallyMoved = useRef(false);
   useEffect(() => {
     const area = field.current;
     if (!area) return;
     const canvas = map.getContainer();
+    let fitting = false;
+    function markManualMovement() {
+      if (!fitting) manuallyMoved.current = true;
+    }
     function fit() {
       if (!area) return;
       map.invalidateSize({ pan: false });
+      if (manuallyMoved.current) return;
       const viewport = canvas.getBoundingClientRect();
       const visible = area.getBoundingClientRect();
+      fitting = true;
       map.fitBounds(latLngBounds(zone), {
         paddingTopLeft: pixel(visible.left - viewport.left + 21, visible.top - viewport.top + 18),
         paddingBottomRight: pixel(viewport.right - visible.right + 21, viewport.bottom - visible.bottom + 27),
         maxZoom: 15,
         animate: false,
       });
+      fitting = false;
     }
 
     const observer = new ResizeObserver(fit);
     observer.observe(area);
+    map.on("dragstart zoomstart", markManualMovement);
     fit();
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      map.off("dragstart zoomstart", markManualMovement);
+    };
   }, [field, map, zone]);
   return null;
 }
 
-function CarPin({ car, position, onCar }: { car: MapCar; position: Point; onCar?: (id: number) => void }) {
+function CarPin({ car, size, onPick }: {
+  car: MapCar;
+  size: PinSize;
+  onPick?: (car: MapCar, event: LeafletMouseEvent) => void;
+}) {
   const marker = useRef<LeafletMarker>(null);
   const [content] = useState(() => document.createElement("span"));
-  const icon = useMemo(() => divIcon({
-    html: content, className: "car-marker", iconSize: [48, 48], iconAnchor: [24, 24],
-  }), [content]);
+  const icon = useMemo(() => {
+    const hitSize = pinHitSizes[size];
+    return divIcon({
+      html: content,
+      className: `car-marker car-marker--${size}`,
+      iconSize: [hitSize, hitSize],
+      iconAnchor: [hitSize / 2, hitSize / 2],
+    });
+  }, [content, size]);
 
   useEffect(() => {
     const element = marker.current?.getElement();
     if (!element) return;
-    if (onCar) {
+    if (onPick) {
       element.setAttribute("aria-label", car.name);
       element.setAttribute("aria-pressed", String(car.active));
     } else {
       element.setAttribute("aria-hidden", "true");
     }
     element.dataset.active = String(car.active);
-  }, [car.active, car.name, onCar]);
+  }, [car.active, car.name, icon, onPick]);
 
   return (
     <>
-      <Marker ref={marker} position={position} icon={icon} keyboard={Boolean(onCar)}
-        interactive={Boolean(onCar)} title={car.name} zIndexOffset={car.active ? 200 : 0}
-        eventHandlers={{ click: () => onCar?.(car.id) }} />
+      <Marker ref={marker} position={car.position} icon={icon} keyboard={Boolean(onPick)}
+        interactive={Boolean(onPick)} title={car.name} zIndexOffset={car.active ? 200 : 0}
+        eventHandlers={{ click: (event) => onPick?.(car, event) }} />
       {createPortal(<CarIcon size={17} aria-hidden="true" />, content)}
     </>
   );
@@ -84,15 +107,37 @@ function CarPins({ cars, onCar }: { cars: MapCar[]; onCar?: (id: number) => void
   const map = useMap();
   const [zoom, setZoom] = useState(() => map.getZoom());
   useMapEvents({ zoomend: () => setZoom(map.getZoom()) });
-  const placed: ReturnType<typeof pixel>[] = [];
+  useEffect(() => setZoom(map.getZoom()), [map]);
+  const size = zoom >= 13 ? "full" : zoom >= 12 ? "compact" : "dot";
 
-  return cars.map((car) => {
-    const origin = map.project(car.position, zoom);
-    const free = offsets.map(([x, y]) => origin.add(pixel(x, y)))
-      .find((candidate) => placed.every((other) => candidate.distanceTo(other) >= 46)) ?? origin;
-    placed.push(free);
-    return <CarPin key={`${car.id}-${Boolean(onCar)}`} car={car} position={map.unproject(free, zoom)} onCar={onCar} />;
-  });
+  function pick(car: MapCar, { originalEvent }: LeafletMouseEvent) {
+    if (!onCar) return;
+    if (!(originalEvent instanceof MouseEvent) || originalEvent.detail === 0) {
+      onCar(car.id);
+      return;
+    }
+
+    // The visible dots can sit closer together than their clickable areas.
+    const pointer = map.mouseEventToContainerPoint(originalEvent);
+    let closest = [car];
+    let distance = Infinity;
+    for (const candidate of cars) {
+      const next = map.latLngToContainerPoint(candidate.position).distanceTo(pointer);
+      if (next < distance) {
+        distance = next;
+        closest = [candidate];
+      } else if (next === distance) {
+        closest.push(candidate);
+      }
+    }
+
+    const active = closest.findIndex((candidate) => candidate.active);
+    onCar(closest[(active + 1) % closest.length].id);
+  }
+
+  return cars.map((car) => (
+    <CarPin key={`${car.id}-${Boolean(onCar)}`} car={car} size={size} onPick={onCar ? pick : undefined} />
+  ));
 }
 
 function ParkingPicker({ point, onPoint, zone, field }: {

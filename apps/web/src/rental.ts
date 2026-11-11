@@ -11,12 +11,7 @@ export type Car = {
   photoUrl: string | null;
 };
 
-export const rentalConfig = {
-  bookingMinutes: 20,
-  hours: [1, 2, 3],
-  hourlyPrice: 599,
-  minutePrice: 13,
-};
+export const bookingMinutes = 20;
 
 export type Plan = { mode: "fixed"; hours: number } | { mode: "metered" };
 export type Rental = { carId: number; plan: Plan };
@@ -65,10 +60,11 @@ export function planName(plan: Plan) {
   return plan.mode === "fixed" ? `На срок · ${plan.hours} ч` : "По факту";
 }
 
-export function price(plan: Plan, elapsed: number) {
+// A ride started before server bookings can still be finished in its original browser.
+export function legacyPrice(plan: Plan, elapsed: number) {
   const paidSeconds = plan.mode === "fixed" ? Math.max(0, elapsed - plan.hours * 3600) : elapsed;
-  const base = plan.mode === "fixed" ? plan.hours * rentalConfig.hourlyPrice : 0;
-  return base + Math.round((paidSeconds / 60) * rentalConfig.minutePrice * 100) / 100;
+  const base = plan.mode === "fixed" ? plan.hours * 59900 : 0;
+  return (base + Math.round(paidSeconds * 1300 / 60)) / 100;
 }
 
 export function insideZone({ lat: y, lng: x }: Point, zone: [number, number][]) {

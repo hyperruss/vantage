@@ -1,10 +1,10 @@
 import { MapPinLine } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, beginRide, cancelReservation, finishRide, getFleetSnapshot, reserveCar } from "./api";
+import { ApiError, beginRide, cancelReservation, finishRide, getFleetSnapshot, payReservation, reserveCar } from "./api";
 import type { FleetSnapshot, MapSettings, Reservation, User } from "./api";
 import { Header, Modal } from "./controls";
 import { FleetMap } from "./FleetMap";
-import { insideZone, price, rentalConfig } from "./rental";
+import { insideZone, legacyPrice } from "./rental";
 import type { Car, Flow, Plan, Point, Ride, Session } from "./rental";
 import { restoreRental, saveRental } from "./rentalStorage";
 import { ActiveRide, FleetSheet, Payment, ReservationSheet, TripReceipt, VehiclePhoto } from "./screens";
@@ -21,15 +21,13 @@ function visibleFlow(snapshot: FleetSnapshot, session: Session): Flow {
   }
 
   if (completed && completed.id !== session.dismissedReservation
-    && completed.startedAt !== null && completed.finishedAt !== null) {
-    if (session.flow.step === "receipt" && session.flow.receipt.reservationId === completed.id) {
-      return session.flow;
-    }
-    const elapsed = durationSeconds(completed.startedAt, completed.finishedAt);
+    && completed.startedAt !== null && completed.elapsedSeconds !== null && completed.amountKopecks !== null) {
+    const paid = completed.paidAt !== null
+      || (session.flow.step === "receipt" && session.flow.receipt.reservationId === completed.id);
     return {
-      step: "payment",
+      step: paid ? "receipt" : "payment",
       receipt: { carId: completed.carId, plan: completed.plan, startedAt: completed.startedAt,
-        reservationId: completed.id, elapsed, total: price(completed.plan, elapsed) },
+        reservationId: completed.id, elapsed: completed.elapsedSeconds, total: completed.amountKopecks / 100 },
     };
   }
 
@@ -42,6 +40,7 @@ const errors: Record<string, string> = {
   reservation_expired: "Время брони истекло. Выберите автомобиль, чтобы забронировать снова.",
   invalid_reservation_state: "Состояние брони изменилось.",
   outside_zone: "Эта точка вне зоны. Выберите место внутри контура.",
+  tariff_changed: "Тариф изменился. Проверьте новую цену перед бронированием.",
 };
 
 export function RentalApp({ user, initialFleet, map, onSignOut }: {
@@ -51,7 +50,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
   const [session, setSession] = useState(() => restoreRental(user, initialFleet.cars));
   const [selection, setSelection] = useState<number | null>(() =>
     initialFleet.cars.find((item) => item.available)?.id ?? null);
-  const [plan, setPlan] = useState<Plan>({ mode: "fixed", hours: rentalConfig.hours[0] });
+  const [plan, setPlan] = useState<Plan>({ mode: "fixed", hours: initialFleet.tariffs.hours[0] });
   const [localNow, setNow] = useState(Date.now);
   const [choosingEnd, setChoosingEnd] = useState(false);
   const [point, setPoint] = useState<Point | null>(null);
@@ -66,7 +65,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
   const stage = flow.step === "ride" && choosingEnd ? "finish" : flow.step;
   const ticking = flow.step === "reserved" || flow.step === "ride";
   const now = localNow + snapshot.clockOffset;
-  const { cars } = snapshot;
+  const { cars, tariffs } = snapshot;
   const fleet = flow.step === "fleet";
   const selectedCar = cars.find((item) => item.id === selection && item.available);
   const currentCar = flow.step === "fleet" ? (selectedCar?.id ?? null) : flow.step === "reserved"
@@ -74,7 +73,12 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
   const car = cars.find(({ id }) => id === currentCar);
   const remaining = flow.step === "reserved" ? Math.max(0, Math.ceil((flow.booking.expiresAt - now) / 1000)) : 0;
   const elapsed = flow.step === "ride" ? durationSeconds(flow.ride.startedAt, now) : 0;
+  const rideTotal = flow.step !== "ride" ? null : flow.ride.reservationId === undefined
+    ? legacyPrice(flow.ride.plan, elapsed)
+    : snapshot.current?.amountKopecks != null ? snapshot.current.amountKopecks / 100 : null;
   const validPoint = point !== null && insideZone(point, map.zone);
+  const localPaymentId = session.flow.step === "receipt"
+    ? session.flow.receipt.reservationId ?? session.dismissedReservation : session.dismissedReservation;
 
   const refresh = useCallback(async () => {
     if (request.current || changing.current) return;
@@ -82,16 +86,25 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
     request.current = controller;
     try {
       const updated = await getFleetSnapshot(controller.signal);
+      // Before server payments, the browser kept the receipt or its dismissed ID.
+      if (updated.completed?.paidAt === null && updated.completed.id === localPaymentId) {
+        try {
+          updated.completed = await payReservation(localPaymentId, controller.signal);
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 401) throw error;
+        }
+      }
       if (!controller.signal.aborted) setSnapshot(updated);
     } catch (error) {
       if (!controller.signal.aborted && error instanceof ApiError && error.status === 401) onSignOut();
     } finally {
       if (request.current === controller) request.current = null;
     }
-  }, [onSignOut]);
+  }, [localPaymentId, onSignOut]);
 
   useEffect(() => {
     const sync = () => { if (!document.hidden) void refresh(); };
+    if (localPaymentId !== undefined) sync();
     const interval = window.setInterval(sync, 2000);
     document.addEventListener("visibilitychange", sync);
     return () => {
@@ -100,7 +113,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
       request.current?.abort();
       request.current = null;
     };
-  }, [refresh]);
+  }, [localPaymentId, refresh]);
 
   useEffect(() => saveRental(user, session), [user, session]);
 
@@ -154,7 +167,8 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
       setNow(Date.now());
       setSnapshot((previous) => ({
         ...previous,
-        current: reservation.status === "active" || reservation.status === "reserved" ? reservation : null,
+        current: reservation.status === "active" || reservation.status === "reserved" ? reservation
+          : previous.current?.id === reservation.id ? null : previous.current,
         completed: reservation.status === "completed" ? reservation : previous.completed,
       }));
       if (reservation.status === "completed") setChoosingEnd(false);
@@ -169,8 +183,8 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
         || "Не удалось выполнить действие. Попробуйте ещё раз.");
     } finally {
       changing.current = false;
-      await refresh();
       setPending(false);
+      await refresh();
     }
   }
 
@@ -183,7 +197,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
     }
     const seconds = durationSeconds(ride.startedAt, Date.now());
     setSession({ ...session, flow: { step: "payment", receipt: {
-      ...ride, elapsed: seconds, total: price(ride.plan, seconds),
+      ...ride, elapsed: seconds, total: legacyPrice(ride.plan, seconds),
     } } });
     setChoosingEnd(false);
   }
@@ -191,6 +205,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
   function returnToMap() {
     if (flow.step !== "receipt") return;
     setSelection(flow.receipt.carId);
+    setNotice("");
     setSession({ flow: { step: "fleet" }, dismissedReservation: flow.receipt.reservationId ?? session.dismissedReservation });
   }
 
@@ -209,8 +224,8 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
           header={<Header onProfile={profile} />}>
           {notice && <p className="map-notice" role="status">{notice}</p>}
           {fleet && (car ? (
-            <FleetSheet car={car} plan={plan} onPlan={setPlan} onPhoto={photo} pending={pending}
-              onBook={() => void change(() => reserveCar(car.id, plan))} onCollapse={() => setSelection(null)} />
+            <FleetSheet car={car} plan={plan} tariffs={tariffs} onPlan={setPlan} onPhoto={photo} pending={pending}
+              onBook={() => void change(() => reserveCar(car.id, plan, tariffs))} onCollapse={() => setSelection(null)} />
           ) : (
             <section className="sheet map-guide" aria-label="Автомобили">
               <MapPinLine size={24} aria-hidden="true" />
@@ -227,7 +242,7 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
         </FleetMap>
       )}
       {flow.step === "ride" && car && !choosingEnd && (
-        <ActiveRide ride={flow.ride} car={car} elapsed={elapsed} onProfile={profile}
+        <ActiveRide ride={flow.ride} car={car} elapsed={elapsed} total={rideTotal} onProfile={profile}
           onFinish={() => { setPoint(null); setNotice(""); setChoosingEnd(true); }} />
       )}
       {stage === "finish" && flow.step === "ride" && (
@@ -247,8 +262,12 @@ export function RentalApp({ user, initialFleet, map, onSignOut }: {
         </FleetMap>
       )}
       {flow.step === "payment" && car && (
-        <Payment receipt={flow.receipt} car={car} onProfile={profile}
-          onPay={() => setSession({ ...session, flow: { step: "receipt", receipt: flow.receipt } })} />
+        <Payment receipt={flow.receipt} car={car} onProfile={profile} pending={pending} error={notice}
+          onPay={() => {
+            const id = flow.receipt.reservationId;
+            if (id !== undefined) void change(() => payReservation(id));
+            else setSession({ ...session, flow: { step: "receipt", receipt: flow.receipt } });
+          }} />
       )}
       {flow.step === "receipt" && car && (
         <TripReceipt receipt={flow.receipt} car={car} onReturn={returnToMap} onProfile={profile} />

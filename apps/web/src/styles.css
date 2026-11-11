@@ -150,7 +150,7 @@ img { display: block; }
   .action:not(:disabled):hover { background: #eeede7; }
   .action-quiet:not(:disabled):hover { background: #232625; }
   .icon-button:hover, .photo-button:hover, .term-options button:hover, .plan:hover { border-color: #8c918a; }
-  .car-marker:not(:disabled):hover span { transform: scale(1.1); }
+  .car-marker.leaflet-interactive:hover span { transform: scale(1.1); }
 }
 
 .map-scene {
@@ -200,9 +200,11 @@ img { display: block; }
 .leaflet-container.map-target { cursor: crosshair; }
 .map-target:focus-visible, .car-marker:focus-visible { outline: 2px solid #e5e6da; outline-offset: 1px; }
 .car-marker {
+  --pin-size: 34px;
+  --pin-active-size: 41px;
+  --pin-icon-size: 17px;
+  --pin-ring: 5px;
   position: absolute;
-  width: 48px;
-  height: 48px;
   display: grid;
   place-items: center;
   padding: 0;
@@ -212,23 +214,37 @@ img { display: block; }
   color: #e0e4dc;
   z-index: 1;
 }
+.car-marker--compact {
+  --pin-size: 22px;
+  --pin-active-size: 27px;
+  --pin-icon-size: 12px;
+  --pin-ring: 3px;
+}
+.car-marker--dot {
+  --pin-size: 8px;
+  --pin-active-size: 11px;
+  --pin-ring: 2px;
+}
 .car-marker span {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: var(--pin-size);
+  height: var(--pin-size);
   place-items: center;
   border-radius: 50%;
   border: 1px solid #999e96;
   background: #171a18;
   box-shadow: 0 2px 8px #0006;
 }
+.car-marker svg { width: var(--pin-icon-size); height: var(--pin-icon-size); }
+.car-marker--dot span { background: #c5c9bd; border-color: #202420; }
+.car-marker--dot svg { display: none; }
 .car-marker[data-active="true"] span {
-  width: 41px;
-  height: 41px;
+  width: var(--pin-active-size);
+  height: var(--pin-active-size);
   border-color: #e8e9df;
   background: #e1e2d8;
   color: #202420;
-  box-shadow: 0 0 0 5px #d6ded349, 0 3px 10px #0006;
+  box-shadow: 0 0 0 var(--pin-ring) #d6ded349, 0 3px 10px #0006;
 }
 .end-marker {
   position: absolute;
@@ -401,6 +417,7 @@ img { display: block; }
 .metric-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 60px; color: var(--muted); font-size: .9rem; }
 .metric-row strong { color: #edece7; font-size: 1.05rem; font-weight: 560; font-variant-numeric: tabular-nums; text-align: right; }
 .journey-footer { margin-top: auto; padding-top: 34px; }
+.journey-footer .form-error { margin-bottom: 12px; }
 .receipt-check {
   display: grid;
   place-items: center;
